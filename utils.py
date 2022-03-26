@@ -440,6 +440,11 @@ def parse_schedulers(sch_list):
 
 
 def save_model(model, modelargs, criterion, optimizer, scheduler, num_epochs, results, batch=None):
+    if not models_path.exists():
+        models_path.mkdir(755)
+    if not output_path.exists():
+        output_path.mkdir(755)
+    
     ftypes = ['torch', 'yaml ']
     config = dict()
     mname = model.__class__.__name__
