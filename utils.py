@@ -1,6 +1,8 @@
 #
 # Created by V.Sotskov on 19 March 2022
 #
+from collections import namedtuple
+
 import yaml
 import pandas as pd
 import numpy as np
@@ -13,7 +15,7 @@ import torch.nn as nn
 from PIL import Image
 from torch.nn.modules.activation import *
 from torchvision.datasets import VisionDataset
-from torch.utils.data import SubsetRandomSampler, DataLoader
+from torch.utils.data import SubsetRandomSampler, DataLoader, BatchSampler
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -21,6 +23,8 @@ import matplotlib.pyplot as plt
 output_path = Path('./outputs').resolve()
 models_path = Path('./models').resolve()
 
+IMAGE_DIM = 48
+IMAGE_CH = 1
 TORCH_LAYERS = dict(conv2d=nn.Conv2d,
                     maxpool2d=nn.MaxPool2d,
                     avgpool2d=nn.AvgPool2d,
@@ -43,10 +47,14 @@ class EmotionsDataset(VisionDataset):
             self,
             root: str,
             fname: str,
-            transform: Optional[Callable] = None):
+            transform: Optional[Callable] = None,
+            seed: int = 123456789):
 
         super().__init__(root, transform=transform)
 
+        self.rng = np.random.default_rng(seed=seed)
+        self.g_cpu = torch.Generator()
+        self.g_cpu.manual_seed(seed)
         self.train_idxs = None
         self.data: Any = []
         self.targets = []
@@ -86,7 +94,7 @@ class EmotionsDataset(VisionDataset):
     def __len__(self) -> int:
         return len(self.data)
 
-    def split(self, *, ratio=0.8, batch_size=1, seed=123456789):
+    def split(self, *, ratio=0.8, batch_size=1):
         """
         The function to split a dataset into train/test subsets
         Args:
@@ -98,17 +106,32 @@ class EmotionsDataset(VisionDataset):
         n = len(self.data)
 
         # calculate the indexes
-        rng = np.random.default_rng(seed=seed)
-        self.train_idxs = rng.choice(np.arange(n), size=int(ratio * n), replace=False)
+        self.train_idxs = self.rng.choice(np.arange(n), size=int(ratio * n), replace=False)
         ix_test = np.delete(np.arange(n), self.train_idxs)
 
-        g_cpu = torch.Generator()
-        g_cpu.manual_seed(seed)
-        trainsmplr = SubsetRandomSampler(self.train_idxs, g_cpu)
-        testsmplr = SubsetRandomSampler(ix_test, g_cpu)
+        trainsmplr = SubsetRandomSampler(self.train_idxs, self.g_cpu)
+        testsmplr = SubsetRandomSampler(ix_test, self.g_cpu)
 
         return DataLoader(self, batch_size=batch_size, sampler=trainsmplr), \
                DataLoader(self, batch_size=1, sampler=testsmplr)
+
+    def kfold(self, K, batch_size=1):
+        KfoldLoader = namedtuple('KfoldLoader', ['validation', 'holdout'])
+        data_size = len(self.train_idxs)
+        indexes = self.rng.permutation(data_size)
+        m, r = divmod(data_size, K)
+        indexes_split = [
+            indexes[i * m + min(i, r):(i + 1) * m + min(i + 1, r)]
+            for i in range(K)
+        ]
+        loaders = []
+        for i in range(K):
+            training_indexes = np.concatenate([indexes_split[j] for j in range(K) if (j != i)])
+            valid = BatchSampler(training_indexes, batch_size=batch_size, drop_last=False)
+            hold = BatchSampler(indexes_split[i], batch_size=1, drop_last=False)
+            loaders.append(KfoldLoader(DataLoader(self, batch_size=batch_size, sampler=valid),
+                                       DataLoader(self, batch_size=1, sampler=hold)))
+        return loaders
 
 
 # class SimpleNet(nn.Module):
@@ -134,85 +157,12 @@ class EmotionsDataset(VisionDataset):
 
 
 class ConvNet(nn.Module):
-    IMAGE_DIM = 48
-    IMAGE_CH = 1
-
     def __init__(self, layers):
         super().__init__()
-        convl_list = []
         linl_list = []
-        outch = None
-        d = ConvNet.IMAGE_DIM
-        for li, layer in enumerate(layers):
-            ltype = layer['ltype'].lower()
-            try:
-                ltype = TORCH_LAYERS[ltype]
-            except KeyError:
-                e = NotImplementedError(f"Adding this type of layer ({layer['ltype']}) is not implemented")
-                print(e)
-                continue
-            activation = layer.get('activation')
-            inch = ConvNet.IMAGE_CH if outch is None else outch
-            outch = layer.get('out_channels', outch)
-            k = layer.get('kernel')
-            pad = layer.get('padding', 0)
-            stride = layer.get('stride', 1)
-            grp = layer.get('groups', 1)
-            bias = layer.get('bias', True)
-
-            if ltype == nn.Conv2d:
-                pad = 0 if pad == 'valid' else pad
-                if pad != 'same':
-                    d = np.floor((d + 2 * pad - k) / stride + 1)
-                convl_list.append(ltype(in_channels=inch, out_channels=outch,
-                                        kernel_size=k, stride=stride, padding=pad,
-                                        groups=grp, bias=bias))
-            elif ltype == nn.MaxPool2d or ltype == nn.AvgPool2d:
-                d = np.floor((d - k) / stride + 1)
-                convl_list.append(ltype(kernel_size=k, stride=stride))
-            elif ltype == nn.BatchNorm2d:
-                mom = layer.get('momentum', 0.1)
-                aff = layer.get('affine', True)
-                convl_list.append(ltype(outch, momentum=mom, affine=aff))
-            elif ltype == nn.Dropout or ltype == nn.Dropout2d:
-                p = layer.get('p', 0.5)
-                convl_list.append(ltype(p=p, inplace=True))
-            elif ltype == nn.Linear:
-                inch = int(d * d * outch)
-                break
-            else:
-                continue
-
-            if activation is not None:
-                convl_list.append(activation)
-
-        for layer in layers[li:]:
-            # We moved to linear layers
-            ltype = layer['ltype'].lower()
-            try:
-                ltype = TORCH_LAYERS[ltype]
-            except KeyError:
-                e = NotImplementedError(f"Adding this type of layer ({layer['ltype']}) is not implemented")
-                print(e)
-                continue
-            outch = layer['out_features']
-            bias = layer.get('bias', True)
-            activation = layer.get('activation')
-            if ltype == nn.Linear:
-                linl_list.append(ltype(inch, outch, bias=bias))
-            elif ltype == nn.BatchNorm2d:
-                mom = layer.get('momentum', 0.1)
-                aff = layer.get('affine', True)
-                convl_list.append(ltype(outch, momentum=mom, affine=aff))
-            elif ltype == nn.Dropout or ltype == nn.Dropout2d:
-                p = layer.get('p', 0.5)
-                convl_list.append(ltype(p=p, inplace=True))
-            else:
-                continue
-            if activation is not None:
-                linl_list.append(activation)
-            inch = outch
-
+        d = IMAGE_DIM
+        convl_list, inch, li = make_convpart(layers, d)
+        linl_list = make_linpart(layers[li:], inch)
         self.conv = nn.Sequential(*convl_list)
         self.linear = nn.Sequential(*linl_list)
 
@@ -224,54 +174,64 @@ class ConvNet(nn.Module):
 
 
 class AttentionalNet(nn.Module):
-    def __init__(self):
+    def __init__(self, layers):
         super().__init__()
         # Spatial transformer localization-network
-        self.localization = nn.Sequential(
-            nn.Conv2d(1, 8, kernel_size=3),
-            nn.MaxPool2d(2, stride=2),
-            nn.ReLU(True),
-            nn.Conv2d(8, 10, kernel_size=3),
-            nn.MaxPool2d(2, stride=2),
-            nn.ReLU(True)
-        )
+        # self.localization = nn.Sequential(
+        #     nn.Conv2d(1, 8, kernel_size=3),
+        #     nn.MaxPool2d(2, stride=2),
+        #     nn.ReLU(True),
+        #     nn.Conv2d(8, 10, kernel_size=3),
+        #     nn.MaxPool2d(2, stride=2),
+        #     nn.ReLU(True)
+        # )
+        stn_layers = layers['attention']
+        stn_conv, inch, li = make_convpart(stn_layers, IMAGE_DIM)
+        self.localization = nn.Sequential(*stn_conv)
 
         # Regressor for the 3 * 2 affine matrix
-        self.fc_loc = nn.Sequential(
-            nn.Linear(10 * 10 * 10, 48),
-            nn.ReLU(True),
-            nn.Linear(48, 3 * 2)
-        )
+        # self.fc_loc = nn.Sequential(
+        #     nn.Linear(10 * 10 * 10, 48),
+        #     nn.ReLU(True),
+        #     nn.Linear(48, 3 * 2)
+        # )
+        stn_fc = make_linpart(stn_layers[li:], inch)
+        self.fc_loc = nn.Sequential(*stn_fc)
 
         # Initialize the weights/bias with identity transformation
-        self.fc_loc[2].weight.data.zero_()
-        self.fc_loc[2].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
+        self.fc_loc[-1].weight.data.zero_()
+        self.fc_loc[-1].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
 
         # Sequential convolution network
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(1, 10, kernel_size=3),
-            nn.ReLU(True),
-            nn.Conv2d(10, 10, kernel_size=3),
-            nn.MaxPool2d(2, stride=2),
-            nn.ReLU(True)
-        )
+        # self.conv1 = nn.Sequential(
+        #     nn.Conv2d(1, 10, kernel_size=3),
+        #     nn.ReLU(True),
+        #     nn.Conv2d(10, 10, kernel_size=3),
+        #     nn.MaxPool2d(2, stride=2),
+        #     nn.ReLU(True)
+        # )
+        #
+        # self.conv2 = nn.Sequential(
+        #     nn.Conv2d(10, 10, kernel_size=3),
+        #     nn.ReLU(True),
+        #     nn.Conv2d(10, 10, kernel_size=3),
+        #     nn.MaxPool2d(2, stride=2),
+        #     nn.ReLU(True)
+        # )
+        #
+        # self.conv2_drop = nn.Dropout2d()
+        fex_layers = layers['features']
+        fex_conv, inch, li = make_convpart(fex_layers, IMAGE_DIM)
+        self.conv = nn.Sequential(*fex_conv)
+        # self.fc1 = nn.Linear(810, 50)
+        # self.fc2 = nn.Linear(50, 7)
+        fex_fc = make_linpart(fex_layers[li:], inch)
+        self.fc = nn.Sequential(*fex_fc)
 
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(10, 10, kernel_size=3),
-            nn.ReLU(True),
-            nn.Conv2d(10, 10, kernel_size=3),
-            nn.MaxPool2d(2, stride=2),
-            nn.ReLU(True)
-        )
-
-        self.conv2_drop = nn.Dropout2d()
-        self.fc1 = nn.Linear(810, 50)
-        self.fc2 = nn.Linear(50, 7)
-
-    # Spatial transformer network forward function
     def stn(self, x):
         xs = self.localization(x)
-        xs = xs.view(-1, 10 * 10 * 10)
+        # xs = xs.view(-1, 10 * 10 * 10)
+        xs = torch.flatten(xs, 1)
         theta = self.fc_loc(xs)
         theta = theta.view(-1, 2, 3)
 
@@ -284,18 +244,21 @@ class AttentionalNet(nn.Module):
         x = self.stn(x)
 
         # Perform the usual forward pass
-        x = self.conv1(x)
-        x = self.conv2_drop(self.conv2(x))
-        x = x.view(-1, 810)
-        x = F.relu(self.fc1(x))
-        x = self.fc2(x)
+        # x = self.conv1(x)
+        # x = self.conv2_drop(self.conv2(x))
+        x = self.conv(x)
+        # x = x.view(-1, 810)
+        x = torch.flatten(x, 1)
+        # x = F.relu(self.fc1(x))
+        # x = self.fc2(x)
+        x = self.fc(x)
         return x
 
 
 ####
 # Helper functions
 ###
-def train(model, criterion, optimizer, scheduler, trainloader, num_epochs):
+def train(model, criterion, optimizer, scheduler, trainloader, num_epochs, verbose=True):
     for epoch in range(num_epochs):
         running_loss = 0.0
         print(f"Epoch {epoch + 1}")
@@ -307,7 +270,7 @@ def train(model, criterion, optimizer, scheduler, trainloader, num_epochs):
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
-            if i % 2000 == 1999:
+            if i % 2000 == 1999 and verbose:
                 print(f'[{epoch + 1}, {i + 1:5d}] loss: {running_loss / 2000:.3f}')
                 running_loss = 0.0
         if scheduler is not None:
@@ -317,6 +280,107 @@ def train(model, criterion, optimizer, scheduler, trainloader, num_epochs):
             else:
                 scheduler.step()
     print('Finished Training')
+
+
+def cross_validate(nfolds, dataset, model, criterion, optimizer, scheduler, labels_dict, batch_size):
+    loaders = dataset.kfold(nfolds, batch_size=batch_size)
+
+    validation_error = 0
+    for ll in loaders:
+        train(model, criterion, optimizer, scheduler, ll.validation, 1, False)
+        accydf = check_accuracy(model, criterion, ll.holdout, labels_dict, False)
+        accy = np.sum(np.diag(accydf.drop('avg_loss', axis=1).values)) / accydf.drop('avg_loss', axis=1).sum().sum()
+        validation_error += (1 - accy)
+    return validation_error / nfolds
+
+
+def grid_search(objective, grid, param_name=""):
+    values = np.array([])
+    for point in grid:
+        print(f"Testing {param_name} value {point:.6f}...")
+        values = np.append(values, objective(point))
+        print(f"Done, error={values[-1]:.6f}")
+    return grid[np.argmin(values)]
+
+
+def make_convpart(layers, dim, outch=None):
+    convl_list = []
+    for li, layer in enumerate(layers):
+        ltype = layer['ltype'].lower()
+        try:
+            ltype = TORCH_LAYERS[ltype]
+        except KeyError:
+            e = NotImplementedError(f"Adding this type of layer ({layer['ltype']}) is not implemented")
+            print(e)
+            continue
+        activation = layer.get('activation')
+        inch = IMAGE_CH if outch is None else outch
+        outch = layer.get('out_channels', outch)
+        k = layer.get('kernel')
+        pad = layer.get('padding', 0)
+        stride = layer.get('stride', 1)
+        grp = layer.get('groups', 1)
+        bias = layer.get('bias', True)
+
+        if ltype == nn.Conv2d:
+            pad = 0 if pad == 'valid' else pad
+            if pad != 'same':
+                dim = np.floor((dim + 2 * pad - k) / stride + 1)
+            convl_list.append(ltype(in_channels=inch, out_channels=outch,
+                                    kernel_size=k, stride=stride, padding=pad,
+                                    groups=grp, bias=bias))
+        elif ltype == nn.MaxPool2d or ltype == nn.AvgPool2d:
+            dim = np.floor((dim - k) / stride + 1)
+            convl_list.append(ltype(kernel_size=k, stride=stride))
+        elif ltype == nn.BatchNorm2d:
+            mom = layer.get('momentum', 0.1)
+            aff = layer.get('affine', True)
+            convl_list.append(ltype(outch, momentum=mom, affine=aff))
+        elif ltype == nn.Dropout or ltype == nn.Dropout2d:
+            p = layer.get('p', 0.5)
+            convl_list.append(ltype(p=p))
+        elif ltype == nn.Linear:
+            inch = int(dim * dim * outch)
+            break
+        else:
+            continue
+
+        if activation is not None:
+            convl_list.append(activation)
+
+    return convl_list, inch, li
+
+
+def make_linpart(layers, inch):
+    linl_list = []
+    for layer in layers:
+        # We moved to linear layers
+        ltype = layer['ltype'].lower()
+        try:
+            ltype = TORCH_LAYERS[ltype]
+        except KeyError:
+            e = NotImplementedError(f"Adding this type of layer ({layer['ltype']}) is not implemented")
+            print(e)
+            continue
+        outch = layer['out_features']
+        bias = layer.get('bias', True)
+        activation = layer.get('activation')
+        if ltype == nn.Linear:
+            linl_list.append(ltype(inch, outch, bias=bias))
+        elif ltype == nn.BatchNorm2d:
+            mom = layer.get('momentum', 0.1)
+            aff = layer.get('affine', True)
+            linl_list.append(ltype(outch, momentum=mom, affine=aff))
+        elif ltype == nn.Dropout or ltype == nn.Dropout2d:
+            p = layer.get('p', 0.5)
+            linl_list.append(ltype(p=p))
+        else:
+            continue
+        if activation is not None:
+            linl_list.append(activation)
+        inch = outch
+
+    return linl_list
 
 
 def summary(input_df):
@@ -331,7 +395,7 @@ def summary(input_df):
                         index=['Accuracy for class:'] * len(df.index))
 
 
-def check_accuracy(model, criterion, testloader, labels_dict):
+def check_accuracy(model, criterion, testloader, labels_dict, verbose=True):
     labels = list(labels_dict.values())
     res = pd.DataFrame(index=labels, columns=labels).fillna(0)
     res.index.name = 'True label'
@@ -352,11 +416,12 @@ def check_accuracy(model, criterion, testloader, labels_dict):
         total /= numtestcases
 
     correct = np.sum(np.diag(res.values))
-    print(f'Average loss: {total:.4f}\tAccuracy: {correct}/{numtestcases} ({100 * correct / numtestcases:.1f}%)')
-    for lbl in labels:
-        totals = res.sum(axis=1)
-        disp = res / totals
-        print(f'Accuracy for class {lbl:5s}: {100 * disp.loc[lbl, lbl]:.1f}%')
+    if verbose:
+        print(f'Average loss: {total:.4f}\tAccuracy: {correct}/{numtestcases} ({100 * correct / numtestcases:.1f}%)')
+        for lbl in labels:
+            totals = res.sum(axis=1)
+            disp = res / totals
+            print(f'Accuracy for class {lbl:5s}: {100 * disp.loc[lbl, lbl]:.1f}%')
 
     return res.assign(avg_loss=total)
 
@@ -366,11 +431,11 @@ def parse_schedulers(sch_list):
     retdict = {}
     for i, sch in enumerate(schedulers):
         scname = sch.__class__.__name__
-        scparms = {k: v for k,v in sch.__dict__.items() if k[0] != "_"}
+        scparms = {k: v for k, v in sch.__dict__.items() if k[0] != "_"}
         scparms.pop('optimizer')
         scparms.pop('base_lrs')
         scparms.pop('verbose')
-        retdict[f"scheduler{i+1}"] = {'class': scname, 'params': scparms}
+        retdict[f"scheduler{i + 1}"] = {'class': scname, 'params': scparms}
     return retdict
 
 
@@ -414,7 +479,7 @@ def save_model(model, modelargs, criterion, optimizer, scheduler, num_epochs, re
     data = results.drop('avg_loss', axis=1)
     im, bar = heatmap(100 * data / data.sum(axis=1), ax=ax, cbarlabel="accuracy, %")
     annotate_heatmap(im, valfmt="{x:.1f}%", textcolors=('w', 'b'))
-    plt.savefig(output_path/(fname+'.png'), format='png')
+    plt.savefig(output_path / (fname + '.png'), format='png')
     plt.close(fig)
     print(f"Model specs ({ftypes} files) saved into ./models folder under name {fname}.\nThe model's results (.tex and "
           f".png files) are saved into ./outputs folder under the same name")
@@ -519,8 +584,8 @@ def heatmap(data, ax=None, cbar_kw=None, cbarlabel="", **kwargs):
     # Turn spines off and create white grid.
     ax.spines[:].set_visible(False)
 
-    ax.set_xticks(np.arange(data.shape[1]+1)-.5, minor=True)
-    ax.set_yticks(np.arange(data.shape[0]+1)-.5, minor=True)
+    ax.set_xticks(np.arange(data.shape[1] + 1) - .5, minor=True)
+    ax.set_yticks(np.arange(data.shape[0] + 1) - .5, minor=True)
     ax.set_xlabel(data.columns.name)
     ax.set_ylabel(data.index.name)
     ax.grid(which="minor", color="w", linestyle='-', linewidth=3)
@@ -564,7 +629,7 @@ def annotate_heatmap(im, data=None, valfmt="{x:.2f}",
     if threshold is not None:
         threshold = im.norm(threshold)
     else:
-        threshold = im.norm(data.max())/2.
+        threshold = im.norm(data.max()) / 2.
 
     # Set default alignment to center, but allow it to be
     # overwritten by textkw.
@@ -586,4 +651,3 @@ def annotate_heatmap(im, data=None, valfmt="{x:.2f}",
             texts.append(text)
 
     return texts
-
