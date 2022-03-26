@@ -167,7 +167,6 @@ class ConvNet(nn.Module):
                 convl_list.append(ltype(in_channels=inch, out_channels=outch,
                                         kernel_size=k, stride=stride, padding=pad,
                                         groups=grp, bias=bias))
-                convl_list.append(activation)
             elif ltype == nn.MaxPool2d or ltype == nn.AvgPool2d:
                 d = np.floor((d - k) / stride + 1)
                 convl_list.append(ltype(kernel_size=k, stride=stride))
@@ -184,6 +183,9 @@ class ConvNet(nn.Module):
             else:
                 continue
 
+            if activation is not None:
+                convl_list.append(activation)
+
         for layer in layers[li:]:
             # We moved to linear layers
             ltype = layer['ltype'].lower()
@@ -196,7 +198,17 @@ class ConvNet(nn.Module):
             outch = layer['out_features']
             bias = layer.get('bias', True)
             activation = layer.get('activation')
-            linl_list.append(ltype(inch, outch, bias=bias))
+            if ltype == nn.Linear:
+                linl_list.append(ltype(inch, outch, bias=bias))
+            elif ltype == nn.BatchNorm2d:
+                mom = layer.get('momentum', 0.1)
+                aff = layer.get('affine', True)
+                convl_list.append(ltype(outch, momentum=mom, affine=aff))
+            elif ltype == nn.Dropout or ltype == nn.Dropout2d:
+                p = layer.get('p', 0.5)
+                convl_list.append(ltype(p=p, inplace=True))
+            else:
+                continue
             if activation is not None:
                 linl_list.append(activation)
             inch = outch
