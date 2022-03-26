@@ -1,17 +1,33 @@
 #
 # Created by V.Sotskov on 19 March 2022
 #
+import yaml
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Optional, Callable, Any, Tuple
+from typing import Callable, Any
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from PIL import Image
+from torch.nn.modules.activation import *
 from torchvision.datasets import VisionDataset
 from torch.utils.data import SubsetRandomSampler, DataLoader
+
+import matplotlib
+import matplotlib.pyplot as plt
+
+output_path = Path('./outputs').resolve()
+models_path = Path('./models').resolve()
+
+TORCH_LAYERS = dict(conv2d=nn.Conv2d,
+                    maxpool2d=nn.MaxPool2d,
+                    avgpool2d=nn.AvgPool2d,
+                    batchnorm2d=nn.BatchNorm2d,
+                    dropout=nn.Dropout,
+                    dropout2d=nn.Dropout2d,
+                    linear=nn.Linear)
 
 
 class EmotionsDataset(VisionDataset):
@@ -92,47 +108,112 @@ class EmotionsDataset(VisionDataset):
         testsmplr = SubsetRandomSampler(ix_test, g_cpu)
 
         return DataLoader(self, batch_size=batch_size, sampler=trainsmplr), \
-            DataLoader(self, batch_size=1, sampler=testsmplr)
+               DataLoader(self, batch_size=1, sampler=testsmplr)
 
 
-class SimpleNet(nn.Module):
+# class SimpleNet(nn.Module):
+#     def __init__(self, layers, activation, pooling=None):
+#         super().__init__()
+#         layer_list = []
+#         for layer in layers:
+#             layer_list.append(layer.pop('ltype')(**layer))
+#         self.layers = nn.ModuleList(layer_list)
+#         self.activation = activation
+#         self.pool = pooling
+#
+#     def forward(self, x):
+#         for i, layer in enumerate(self.layers):
+#             if isinstance(self.layers[i - 1], nn.Conv2d) and isinstance(layer, nn.Linear):
+#                 x = torch.flatten(x, 1)
+#             x = layer(x)
+#             if i != len(self.layers) - 1:
+#                 x = self.activation(x)
+#                 if isinstance(layer, nn.Conv2d) and self.pool is not None:
+#                     x = self.pool(x)
+#         return x
 
-    def __init__(self, layers, activation, pooling=None):
+
+class ConvNet(nn.Module):
+    IMAGE_DIM = 48
+    IMAGE_CH = 1
+
+    def __init__(self, layers):
         super().__init__()
-        layer_list = []
-        for layer in layers:
-            layer_list.append(layer.pop('ltype')(**layer))
-        self.layers = nn.ModuleList(layer_list)
-        self.activation = activation
-        self.pool = pooling
+        convl_list = []
+        linl_list = []
+        outch = None
+        d = ConvNet.IMAGE_DIM
+        for li, layer in enumerate(layers):
+            ltype = layer['ltype'].lower()
+            try:
+                ltype = TORCH_LAYERS[ltype]
+            except KeyError:
+                e = NotImplementedError(f"Adding this type of layer ({layer['ltype']}) is not implemented")
+                print(e)
+                continue
+            activation = layer.get('activation')
+            inch = ConvNet.IMAGE_CH if outch is None else outch
+            outch = layer.get('out_channels', outch)
+            k = layer.get('kernel')
+            pad = layer.get('padding', 0)
+            stride = layer.get('stride', 1)
+            grp = layer.get('groups', 1)
+            bias = layer.get('bias', True)
+
+            if ltype == nn.Conv2d:
+                pad = 0 if pad == 'valid' else pad
+                if pad != 'same':
+                    d = np.floor((d + 2 * pad - k) / stride + 1)
+                convl_list.append(ltype(in_channels=inch, out_channels=outch,
+                                        kernel_size=k, stride=stride, padding=pad,
+                                        groups=grp, bias=bias))
+                convl_list.append(activation)
+            elif ltype == nn.MaxPool2d or ltype == nn.AvgPool2d:
+                d = np.floor((d - k) / stride + 1)
+                convl_list.append(ltype(kernel_size=k, stride=stride))
+            elif ltype == nn.BatchNorm2d:
+                mom = layer.get('momentum', 0.1)
+                aff = layer.get('affine', True)
+                convl_list.append(ltype(outch, momentum=mom, affine=aff))
+            elif ltype == nn.Dropout or ltype == nn.Dropout2d:
+                p = layer.get('p', 0.5)
+                convl_list.append(ltype(p=p, inplace=True))
+            elif ltype == nn.Linear:
+                inch = int(d * d * outch)
+                break
+            else:
+                continue
+
+        for layer in layers[li:]:
+            # We moved to linear layers
+            ltype = layer['ltype'].lower()
+            try:
+                ltype = TORCH_LAYERS[ltype]
+            except KeyError:
+                e = NotImplementedError(f"Adding this type of layer ({layer['ltype']}) is not implemented")
+                print(e)
+                continue
+            outch = layer['out_features']
+            bias = layer.get('bias', True)
+            activation = layer.get('activation')
+            linl_list.append(ltype(inch, outch, bias=bias))
+            if activation is not None:
+                linl_list.append(activation)
+            inch = outch
+
+        self.conv = nn.Sequential(*convl_list)
+        self.linear = nn.Sequential(*linl_list)
 
     def forward(self, x):
-        for i, layer in enumerate(self.layers):
-            if isinstance(self.layers[i-1], nn.Conv2d) and isinstance(layer, nn.Linear):
-                x = torch.flatten(x, 1)
-            x = layer(x)
-            if i != len(self.layers)-1:
-                x = self.activation(x)
-                if isinstance(layer, nn.Conv2d) and self.pool is not None:
-                    x = self.pool(x)
+        x = self.conv(x)
+        x = torch.flatten(x, 1)
+        x = self.linear(x)
         return x
 
 
 class AttentionalNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(1, 10, kernel_size=3),
-            nn.ReLU(True),
-            nn.Conv2d(10, 10, kernel_size=3),
-            nn.MaxPool2d(2, stride=2),
-            nn.ReLU(True)
-        )
-
-        self.conv2_drop = nn.Dropout2d()
-        self.fc1 = nn.Linear(810, 50)
-        self.fc2 = nn.Linear(50, 7)
-
         # Spatial transformer localization-network
         self.localization = nn.Sequential(
             nn.Conv2d(1, 8, kernel_size=3),
@@ -154,6 +235,27 @@ class AttentionalNet(nn.Module):
         self.fc_loc[2].weight.data.zero_()
         self.fc_loc[2].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
 
+        # Sequential convolution network
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(1, 10, kernel_size=3),
+            nn.ReLU(True),
+            nn.Conv2d(10, 10, kernel_size=3),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True)
+        )
+
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(10, 10, kernel_size=3),
+            nn.ReLU(True),
+            nn.Conv2d(10, 10, kernel_size=3),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True)
+        )
+
+        self.conv2_drop = nn.Dropout2d()
+        self.fc1 = nn.Linear(810, 50)
+        self.fc2 = nn.Linear(50, 7)
+
     # Spatial transformer network forward function
     def stn(self, x):
         xs = self.localization(x)
@@ -161,8 +263,8 @@ class AttentionalNet(nn.Module):
         theta = self.fc_loc(xs)
         theta = theta.view(-1, 2, 3)
 
-        grid = F.affine_grid(theta, x.size())
-        x = F.grid_sample(x, grid)
+        grid = F.affine_grid(theta, x.size(), align_corners=False)
+        x = F.grid_sample(x, grid, align_corners=False)
         return x
 
     def forward(self, x):
@@ -170,9 +272,306 @@ class AttentionalNet(nn.Module):
         x = self.stn(x)
 
         # Perform the usual forward pass
-        x = self.conv(x)
-        x = self.conv2_drop(self.conv(x))
+        x = self.conv1(x)
+        x = self.conv2_drop(self.conv2(x))
         x = x.view(-1, 810)
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
         return x
+
+
+####
+# Helper functions
+###
+def train(model, criterion, optimizer, scheduler, trainloader, num_epochs):
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        print(f"Epoch {epoch + 1}")
+        for i, data in tqdm(enumerate(trainloader)):
+            inputs, labels = data
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+            if i % 2000 == 1999:
+                print(f'[{epoch + 1}, {i + 1:5d}] loss: {running_loss / 2000:.3f}')
+                running_loss = 0.0
+        if scheduler is not None:
+            if isinstance(scheduler, list):
+                for s in scheduler:
+                    s.step()
+            else:
+                scheduler.step()
+    print('Finished Training')
+
+
+def summary(input_df):
+    avg_loss = input_df['avg_loss'].iloc[0]
+    df = input_df.drop('avg_loss', axis=1)
+    correct = np.sum(np.diag(df.values))
+    numtests = df.sum().sum()
+    avg_loss = f"Average loss: {avg_loss:.4f}"
+    accy = f"Accuracy: {correct}/{numtests} ({100 * correct / numtests:.0f}%)"
+    cls_accy = np.diag(df.values) / df.sum(axis=1).values
+    return pd.DataFrame({avg_loss: list(df.index), accy: cls_accy},
+                        index=['Accuracy for class:'] * len(df.index))
+
+
+def check_accuracy(model, criterion, testloader, labels_dict):
+    labels = list(labels_dict.values())
+    res = pd.DataFrame(index=labels, columns=labels).fillna(0)
+    res.index.name = 'True label'
+    res.columns.name = 'Predicted label'
+    total = 0
+
+    with torch.no_grad():
+        numtestcases = 0
+        for data in tqdm(testloader):
+            numtestcases += 1
+            image, label = data
+            output = model(image)
+            total += criterion(output, label).item()
+            pred = output.max(1)[1]
+            pred_lbl = labels_dict[pred.item()]
+            true_lbl = labels_dict[label.item()]
+            res.loc[true_lbl, pred_lbl] += 1
+        total /= numtestcases
+
+    correct = np.sum(np.diag(res.values))
+    print(f'Average loss: {total:.4f}\tAccuracy: {correct}/{numtestcases} ({100 * correct / numtestcases:.1f}%)')
+    for lbl in labels:
+        totals = res.sum(axis=1)
+        disp = res / totals
+        print(f'Accuracy for class {lbl:5s}: {100 * disp.loc[lbl, lbl]:.1f}%')
+
+    return res.assign(avg_loss=total)
+
+
+def parse_schedulers(sch_list):
+    schedulers = sch_list if isinstance(sch_list, list) else [sch_list]
+    retdict = {}
+    for i, sch in enumerate(schedulers):
+        scname = sch.__class__.__name__
+        scparms = {k: v for k,v in sch.__dict__.items() if k[0] != "_"}
+        scparms.pop('optimizer')
+        scparms.pop('base_lrs')
+        scparms.pop('verbose')
+        retdict[f"scheduler{i+1}"] = {'class': scname, 'params': scparms}
+    return retdict
+
+
+def save_model(model, modelargs, criterion, optimizer, scheduler, num_epochs, results, batch=None):
+    ftypes = ['torch', 'yaml ']
+    config = dict()
+    mname = model.__class__.__name__
+    config["model"] = {"class": mname, "params": modelargs}
+    lfname = criterion.__class__.__name__
+    lfparms = criterion.__dict__
+    lfparms = {k: v for k, v in lfparms.items() if k != 'training' and k[0] != '_'}
+    config["loss"] = {"class": lfname, "params": lfparms}
+    opname = optimizer.__class__.__name__
+    opparms = optimizer.__dict__['defaults']
+    config["optimizer"] = {"class": opname, "params": opparms}
+    config["epochs"] = num_epochs
+    if scheduler is not None:
+        config["lr_adjusters"] = parse_schedulers([scheduler])
+
+    smry = summary(results)
+    accy = smry.columns[1].split("(")[-1][:-2]
+    fname = f"{mname.lower()}_accy{accy}_v1"
+    # fname = f"{mname.lower()}_{opname.lower()}-lr{opparms['lr']}_v1"
+    while (models_path / (fname + ".pth")).exists():
+        v = int(fname[-1])
+        fname = fname[:-1] + str(v + 1)
+    torch.save(model.state_dict(), models_path / (fname + '.pth'))
+    with open(models_path / (fname + '.yml'), 'w') as f:
+        yaml.dump(config, f, yaml.CDumper)
+    if batch is not None:
+        try:
+            _ = torch.onnx.export(model, batch, models_path / (fname + '.onnx'),
+                                  input_names=['Image'], output_names=['Emotion label'])
+            ftypes = ", ".join(ftypes) + 'and onnx'
+        except RuntimeError:
+            ftypes = "and ".join(ftypes)
+            pass
+
+    smry.to_latex(output_path / (fname + '.tex'), column_format='lrr', escape=True)
+    fig, ax = plt.subplots(figsize=(8, 8))
+    data = results.drop('avg_loss', axis=1)
+    im, bar = heatmap(100 * data / data.sum(axis=1), ax=ax, cbarlabel="accuracy, %")
+    annotate_heatmap(im, valfmt="{x:.1f}%", textcolors=('w', 'b'))
+    plt.savefig(output_path/(fname+'.png'), format='png')
+    plt.close(fig)
+    print(f"Model specs ({ftypes} files) saved into ./models folder under name {fname}.\nThe model's results (.tex and "
+          f".png files) are saved into ./outputs folder under the same name")
+    return fname
+
+
+def load_model(fname):
+    with open(models_path / (fname + ".yml"), 'r') as f:
+        cfg = yaml.load(f, yaml.CLoader)
+    model = cfg['model']
+    invocation = "{}({})".format(model['class'], "" if model['params'] is None else model['params'])
+    net = eval(invocation)
+    net.load_state_dict(torch.load(models_path / (fname + ".pth")))
+    return net, cfg
+
+
+# def check_accuracy(model, criterion, testloader, labels_dict, save=False):
+#     correct = 0
+#     total = 0
+#     correct_pred = {labels_dict[clss]: 0 for clss in labels_dict}
+#     total_pred = {labels_dict[clss]: 0 for clss in labels_dict}
+#     numtestcases = len(testloader.dataset) - len(testloader.dataset.train_idxs)
+#
+#     with torch.no_grad():
+#         i = 0
+#         for data in tqdm(testloader):
+#             i += 1
+#             image, label = data
+#             output = model(image)
+#             total += criterion(output, label).item()
+#             pred = output.max(1, keepdim=True)[1]
+#             iftrue = pred.eq(label.view_as(pred)).sum().item()
+#             correct += iftrue
+#             correct_pred[labels_dict[label.item()]] += iftrue
+#             total_pred[labels_dict[label.item()]] += 1
+#         total /= numtestcases
+#
+#     avg_loss = f"Average loss: {total:.4f}"
+#     accy = f"Accuracy: {correct}/{numtestcases} ({100 * correct / numtestcases:.0f}%)"
+#     cls_accy = []
+#
+#     for classname, correct_count in correct_pred.items():
+#         accuracy = 100 * float(correct_count) / total_pred[classname]
+#         cls_accy.append(f"{accuracy:.1f}%")
+#
+#     res = pd.DataFrame({avg_loss: list(correct_pred.keys()), accy: cls_accy},
+#                        index=['Accuracy for class:'] * len(correct_pred))
+#     if save:
+#         fname = save if isinstance(save, str) else model.__class__.__name__
+#         res.to_latex(output_path / (fname + '.tex'), column_format='lrr', escape=True)
+#         print(f"Saved results table into ./outputs folder under name {fname}.tex")
+#
+#     return res
+
+###
+# Code from matplotlib
+###
+def heatmap(data, ax=None, cbar_kw=None, cbarlabel="", **kwargs):
+    """
+    Create a heatmap from a pandas DataFrame.
+
+    Parameters
+    ----------
+    data
+        A pd.DataFrame of shape (M, N).
+    ax
+        A `matplotlib.axes.Axes` instance to which the heatmap is plotted.  If
+        not provided, use current axes or create a new one.  Optional.
+    cbar_kw
+        A dictionary with arguments to `matplotlib.Figure.colorbar`.  Optional.
+    cbarlabel
+        The label for the colorbar.  Optional.
+    **kwargs
+        All other arguments are forwarded to `imshow`.
+    """
+
+    if cbar_kw is None:
+        cbar_kw = {}
+
+    if not ax:
+        ax = plt.gca()
+
+    # Plot the heatmap
+    im = ax.imshow(data, **kwargs)
+
+    # Create colorbar
+    cbar = ax.figure.colorbar(im, ax=ax, **cbar_kw)
+    cbar.ax.set_ylabel(cbarlabel, rotation=-90, va="bottom")
+
+    # Show all ticks and label them with the respective list entries.
+    ax.set_xticks(np.arange(data.shape[1]), labels=data.columns)
+    ax.set_yticks(np.arange(data.shape[0]), labels=data.index)
+
+    # Let the horizontal axes labeling appear on top.
+    ax.tick_params(top=True, bottom=False,
+                   labeltop=True, labelbottom=False)
+
+    # Rotate the tick labels and set their alignment.
+    plt.setp(ax.get_xticklabels(), rotation=-30, ha="right",
+             rotation_mode="anchor")
+
+    # Turn spines off and create white grid.
+    ax.spines[:].set_visible(False)
+
+    ax.set_xticks(np.arange(data.shape[1]+1)-.5, minor=True)
+    ax.set_yticks(np.arange(data.shape[0]+1)-.5, minor=True)
+    ax.set_xlabel(data.columns.name)
+    ax.set_ylabel(data.index.name)
+    ax.grid(which="minor", color="w", linestyle='-', linewidth=3)
+    ax.tick_params(which="minor", bottom=False, left=False)
+
+    return im, cbar
+
+
+def annotate_heatmap(im, data=None, valfmt="{x:.2f}",
+                     textcolors=("black", "white"),
+                     threshold=None, **textkw):
+    """
+    A function to annotate a heatmap.
+
+    Parameters
+    ----------
+    im
+        The AxesImage to be labeled.
+    data
+        Data used to annotate.  If None, the image's data is used.  Optional.
+    valfmt
+        The format of the annotations inside the heatmap.  This should either
+        use the string format method, e.g. "$ {x:.2f}", or be a
+        `matplotlib.ticker.Formatter`.  Optional.
+    textcolors
+        A pair of colors.  The first is used for values below a threshold,
+        the second for those above.  Optional.
+    threshold
+        Value in data units according to which the colors from textcolors are
+        applied.  If None (the default) uses the middle of the colormap as
+        separation.  Optional.
+    **kwargs
+        All other arguments are forwarded to each call to `text` used to create
+        the text labels.
+    """
+
+    if not isinstance(data, (list, np.ndarray)):
+        data = im.get_array()
+
+    # Normalize the threshold to the images color range.
+    if threshold is not None:
+        threshold = im.norm(threshold)
+    else:
+        threshold = im.norm(data.max())/2.
+
+    # Set default alignment to center, but allow it to be
+    # overwritten by textkw.
+    kw = dict(horizontalalignment="center",
+              verticalalignment="center")
+    kw.update(textkw)
+
+    # Get the formatter in case a string is supplied
+    if isinstance(valfmt, str):
+        valfmt = matplotlib.ticker.StrMethodFormatter(valfmt)
+
+    # Loop over the data and create a `Text` for each "pixel".
+    # Change the text's color depending on the data.
+    texts = []
+    for i in range(data.shape[0]):
+        for j in range(data.shape[1]):
+            kw.update(color=textcolors[int(im.norm(data[i, j]) > threshold)])
+            text = im.axes.text(j, i, valfmt(data[i, j], None), **kw)
+            texts.append(text)
+
+    return texts
+
