@@ -458,7 +458,7 @@ def save_model(model, modelargs, criterion, optimizer, scheduler, num_epochs, re
     if not output_path.exists():
         output_path.mkdir(755)
 
-    ftypes = ['torch', 'yaml ']
+    ftypes = ['torch', 'yaml']
     config = dict()
     mname = model.__class__.__name__
     config["model"] = {"class": mname, "params": modelargs}
@@ -487,9 +487,9 @@ def save_model(model, modelargs, criterion, optimizer, scheduler, num_epochs, re
         try:
             _ = torch.onnx.export(model, batch, models_path / (fname + '.onnx'),
                                   input_names=['Image'], output_names=['Emotion label'])
-            ftypes = ", ".join(ftypes) + 'and onnx'
+            ftypes = ", ".join(ftypes) + ' and onnx'
         except RuntimeError:
-            ftypes = "and ".join(ftypes)
+            ftypes = " and ".join(ftypes)
             pass
 
     smry.to_latex(output_path / (fname + '.tex'), column_format='lrr', escape=True)
