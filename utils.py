@@ -127,8 +127,8 @@ class EmotionsDataset(VisionDataset):
         loaders = []
         for i in range(K):
             training_indexes = np.concatenate([indexes_split[j] for j in range(K) if (j != i)])
-            valid = BatchSampler(training_indexes, batch_size=batch_size, drop_last=False)
-            hold = BatchSampler(indexes_split[i], batch_size=1, drop_last=False)
+            valid = SubsetRandomSampler(training_indexes,self.g_cpu)
+            hold = SubsetRandomSampler(indexes_split[i], self.g_cpu)
             loaders.append(KfoldLoader(DataLoader(self, batch_size=batch_size, sampler=valid),
                                        DataLoader(self, batch_size=1, sampler=hold)))
         return loaders
@@ -259,6 +259,8 @@ class AttentionalNet(nn.Module):
 # Helper functions
 ###
 def train(model, criterion, optimizer, scheduler, trainloader, num_epochs, verbose=True):
+    model.train(True)
+    train_losses = []
     for epoch in range(num_epochs):
         running_loss = 0.0
         print(f"Epoch {epoch + 1}")
@@ -271,6 +273,7 @@ def train(model, criterion, optimizer, scheduler, trainloader, num_epochs, verbo
             optimizer.step()
             running_loss += loss.item()
             if i % 2000 == 1999 and verbose:
+                train_losses.append(running_loss / 2000)
                 print(f'[{epoch + 1}, {i + 1:5d}] loss: {running_loss / 2000:.3f}')
                 running_loss = 0.0
         if scheduler is not None:
@@ -279,14 +282,20 @@ def train(model, criterion, optimizer, scheduler, trainloader, num_epochs, verbo
                     s.step()
             else:
                 scheduler.step()
-    print('Finished Training')
+        if not verbose:
+            train_losses.append(running_loss / i)
+    train_losses = np.array(train_losses)
+    msg = "Finished training" if verbose else f"Finished training. Avg loss: {np.mean(train_losses):.4f}"
+    print(msg)
+    return train_losses
 
 
 def cross_validate(nfolds, dataset, model, criterion, optimizer, scheduler, labels_dict, batch_size):
     loaders = dataset.kfold(nfolds, batch_size=batch_size)
 
     validation_error = 0
-    for ll in loaders:
+    for k, ll in enumerate(loaders):
+        print(f"Fold {k+1}:")
         train(model, criterion, optimizer, scheduler, ll.validation, 1, False)
         accydf = check_accuracy(model, criterion, ll.holdout, labels_dict, False)
         accy = np.sum(np.diag(accydf.drop('avg_loss', axis=1).values)) / accydf.drop('avg_loss', axis=1).sum().sum()
@@ -294,10 +303,13 @@ def cross_validate(nfolds, dataset, model, criterion, optimizer, scheduler, labe
     return validation_error / nfolds
 
 
-def grid_search(objective, grid, param_name=""):
-    values = np.array([])
+def grid_search(objective, grid, param_name="", out=None):
+    if out is None:
+        values = np.array([])
+    else:
+        values = np.array(out)
     for point in grid:
-        print(f"Testing {param_name} value {point:.6f}...")
+        print(f"Testing {param_name} value {point}...")
         values = np.append(values, objective(point))
         print(f"Done, error={values[-1]:.6f}")
     return grid[np.argmin(values)]
@@ -396,6 +408,7 @@ def summary(input_df):
 
 
 def check_accuracy(model, criterion, testloader, labels_dict, verbose=True):
+    model.train(False)
     labels = list(labels_dict.values())
     res = pd.DataFrame(index=labels, columns=labels).fillna(0)
     res.index.name = 'True label'
@@ -444,8 +457,8 @@ def save_model(model, modelargs, criterion, optimizer, scheduler, num_epochs, re
         models_path.mkdir(755)
     if not output_path.exists():
         output_path.mkdir(755)
-    
-    ftypes = ['torch', 'yaml ']
+
+    ftypes = ['torch', 'yaml']
     config = dict()
     mname = model.__class__.__name__
     config["model"] = {"class": mname, "params": modelargs}
@@ -474,9 +487,9 @@ def save_model(model, modelargs, criterion, optimizer, scheduler, num_epochs, re
         try:
             _ = torch.onnx.export(model, batch, models_path / (fname + '.onnx'),
                                   input_names=['Image'], output_names=['Emotion label'])
-            ftypes = ", ".join(ftypes) + 'and onnx'
+            ftypes = ", ".join(ftypes) + ' and onnx'
         except RuntimeError:
-            ftypes = "and ".join(ftypes)
+            ftypes = " and ".join(ftypes)
             pass
 
     smry.to_latex(output_path / (fname + '.tex'), column_format='lrr', escape=True)
